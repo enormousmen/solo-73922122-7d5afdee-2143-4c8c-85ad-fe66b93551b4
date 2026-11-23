@@ -1,0 +1,29 @@
+services:
+  receiver:
+    build:
+      context: .
+      dockerfile: receiver/Dockerfile
+    image: pmtu-receiver:local
+    environment:
+      PORT: "5055"
+      # Drill knobs — override from the shell, e.g.
+      #   DROP_THRESHOLD=1400 docker compose up --build
+      DROP_THRESHOLD: "${DROP_THRESHOLD:-0}"
+      DROP_GROUPS: "${DROP_GROUPS:-}"
+      DUP_RECEIPTS: "${DUP_RECEIPTS:-0}"
+      RECEIPT_DELAY_MS: "${RECEIPT_DELAY_MS:-0}"
+    ports:
+      - "5055:5055/udp"
+
+  api:
+    build:
+      context: .
+      dockerfile: prober/Dockerfile
+    image: pmtu-prober-api:local
+    environment:
+      RECEIVER_HOST: receiver
+      RECEIVER_PORT: "5055"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - receiver
