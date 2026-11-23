@@ -4,9 +4,32 @@
 
 - **API（FastAPI）**：`POST /probe` 接收探测请求（搜索区间 64～1472 字节），
   向**固定接收端**（`RECEIVER_HOST:RECEIVER_PORT`）发送**禁止分片**的 IPv4 UDP
-  报文（`IP_MTU_DISCOVER = IP_PMTUDISC_DO`，即 DF=1）。
+  报文（`IP_MTU_DISCOVER = IP_PMTUDISC_DO`，即 DF=1）。多个 `/probe` 可**并行**
+  执行，进程内所有探测共享一个"在途字节额度"（见下节）。
 - **接收端**：对每个有效探针回一个 28 字节短回执，带回**探针号**和**实收长度**；
   同时是演练用的测试端，可配置门槛丢包、整组丢包、重复/延迟回执。
+
+## 低带宽隧道：在途字节额度（并行 `/probe`）
+
+并行跑多个 `/probe` 时，用**单进程总额度**限制"服务端仍在等回执的探针负载字节数"，
+避免在窄隧道上同时灌入太多在途数据。
+
+| 规则 | 实现 |
+| --- | --- |
+| 用环境变量设置单进程总额度，最低 1536 字节 | `PROBE_INFLIGHT_QUOTA_BYTES`（默认 4096，硬下限 1536 = 最大组 1472+64，保证额度排空后任意组都能发出）；启动时校验，非法值直接报错退出 |
+| 候选包和对照包先一起占足额度再发 | 每组在发送前一次性预订 `候选长度 + 64` 字节，预订成功前不动 socket |
+| 等额度的时间不算回执超时 | 预订可能阻塞；回执等待窗口在预订返回、包发出之后才开始计时（响应每组带 `quota_wait_ms`） |
+| 有额度时其他轮可在这一轮等回执期间发包 | 额度是进程级 `ByteQuota`，多个请求在线程池中并行，只通过额度协调；A 组等回执时 B 组可使用已释放的字节 |
+| 首次有效回执或本组超时即释放 | 每包字节在"首个有效回执"或"本组等待窗口结束"时归还；迟到有效回执仍按原规则确认长度，但不再二次归还 |
+| 发包失败立即归还未发部分 | `sendto` 失败的包标记 `send_failed` 并立刻释放其预订；已发出的包照常等回执或超时 |
+| 沿用现有 API 和报文格式 | 线协议 28 字节头不变；响应仅**新增**字段，旧字段含义不变；新增只读 `GET /quota` |
+
+额度可观测：`GET /quota` 返回 `limit_bytes / inflight_bytes / available_bytes /
+peak_inflight_bytes / active_runs / waiters / total_wait_for_quota_ms /
+released_bytes_by_reason`；`/healthz` 也回显当前额度。每个 `/probe` 响应新增
+`inflight_quota`（额度与累计等额度毫秒）、每组 `quota_wait_ms`、每包
+`quota_bytes` 与 `quota_release_reason`（`receipt` / `group_timeout` /
+`send_failed`）。
 
 ## 探测规则（与值班规范逐条对应）
 
@@ -65,6 +88,33 @@ curl -s -X POST http://localhost:8000/probe \
 黑洞演练（提示重测）：`DROP_THRESHOLD=1 docker compose up --build -d`
 → 连对照都丢，`verdict=retest`，提示"路径可能不通，请重测"。
 
+### 示例 C：并行 `/probe` 共享在途额度（一轮等回执，另一轮用刚释放的额度发包）
+
+```bash
+# 额度取硬下限 1536（一次只够一组最大包在途），回执延迟让重叠肉眼可见
+RECEIPT_DELAY_MS=350 PROBE_INFLIGHT_QUOTA_BYTES=1536 \
+  docker compose up --build -d
+
+# 另开一个终端，两个 /probe 并行
+python3 examples/parallel_quota_demo.py http://localhost:8000
+# 或纯 curl（分两个终端几乎同时执行）
+curl -s -X POST http://localhost:8000/probe \
+  -H 'Content-Type: application/json' -d '{"timeout_ms":1000}' &
+curl -s -X POST http://localhost:8000/probe \
+  -H 'Content-Type: application/json' -d '{"timeout_ms":1000}'
+curl -s http://localhost:8000/quota
+```
+
+预期（脚本会打印并自检 `RESULT: PASS`）：
+
+1. run A 一次预订 1536B 并发出第 1 组，然后等回执；此时
+   `GET /quota` 显示 `inflight_bytes=1536, waiters=1`。
+2. run B 的组预订不到额度而阻塞（不计入它的回执超时）。
+3. A 的回执到达 → 按包释放 1536B（`released_bytes_by_reason.receipt`）
+   → B 立刻预订成功并发包；B 响应第 1 组 `quota_wait_ms > 0` 且
+   `candidate_result=confirmed`（等额度没吃掉它的回执窗口）。
+4. 两轮结束后 `inflight_bytes=0`，所有预订字节均恰好归还一次。
+
 ## API
 
 `POST /probe`，请求体（均可选）：
@@ -82,7 +132,18 @@ curl -s -X POST http://localhost:8000/probe \
 响应关键字段：`verdict`（`ok`/`retest`）、`message`、`max_confirmed_size`、
 `min_suspected_oversize`、`boundary_gap`、`stop_reason`、`packets_sent`、
 `receipts{valid,duplicates,invalid}`、`groups[]`（每组的候选结果/对照是否按时/
-连击数）、`packets[]`（每包的探针号/长度/状态/RTT）。
+连击数/`quota_wait_ms`）、`packets[]`（每包的探针号/长度/状态/RTT/
+`quota_bytes`/`quota_release_reason`）、`inflight_quota`（额度上限与本次累计
+等额度毫秒）。
+
+另有只读端点 `GET /quota`：进程级额度的上限、当前在途/可用字节、峰值、活动
+run 数、等待者、累计等待时间与按原因统计的已释放字节。
+
+### 额度相关环境变量（api 服务）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `PROBE_INFLIGHT_QUOTA_BYTES` | `1536`（compose）；代码默认 `4096` | 单进程在途探针负载字节总额度，硬下限 1536；非法值（非整数或 <1536）启动即报错 |
 
 ## 协议格式（大端，28 字节定长头）
 
@@ -97,21 +158,27 @@ run_id 8s | group I | seq I | value I
 
 ```bash
 pip install -r prober/requirements.txt pytest httpx
-PYTHONPATH=. python -m pytest tests/ -v          # 14 个规则/接口测试
+PYTHONPATH=. python -m pytest tests/ -v          # 28 个规则/接口/额度测试
 
 # 手工端到端（两个终端）
 PYTHONPATH=. PORT=5055 DROP_THRESHOLD=1400 python receiver/receiver.py
 PYTHONPATH=. RECEIVER_HOST=127.0.0.1 RECEIVER_PORT=5055 \
+  PROBE_INFLIGHT_QUOTA_BYTES=1536 \
   uvicorn prober.app.main:app --port 8000
+
+# 并行额度演示（配合 RECEIPT_DELAY_MS=350 的接收端效果最直观）
+python examples/parallel_quota_demo.py http://localhost:8000
 ```
 
 ## 目录结构
 
 ```
-common/protocol.py     # 共享线协议
-prober/app/engine.py   # 探测引擎（规则核心）
-prober/app/main.py     # FastAPI 入口
-receiver/receiver.py   # 固定接收端 / 测试端
-tests/                 # pytest：假接收端 + 规则测试 + API 测试
-docker-compose.yml     # api + receiver 两服务
+common/protocol.py        # 共享线协议（未改动）
+prober/app/quota.py       # 进程级在途字节额度 ByteQuota（环境变量配置）
+prober/app/engine.py      # 探测引擎（规则核心 + 额度预订/归还）
+prober/app/main.py        # FastAPI 入口（并行 /probe、GET /quota）
+receiver/receiver.py      # 固定接收端 / 测试端（未改动）
+examples/                 # 并行额度演示脚本
+tests/                    # pytest：假接收端 + 规则/API/额度测试
+docker-compose.yml        # api + receiver 两服务
 ```

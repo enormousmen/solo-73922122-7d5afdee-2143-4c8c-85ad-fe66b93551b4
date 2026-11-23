@@ -2,25 +2,29 @@
 
 POST /probe starts one probe run against the fixed receiver configured via
 RECEIVER_HOST / RECEIVER_PORT. The run is synchronous (UDP probing with
-timeouts); FastAPI executes it in the threadpool. Runs are serialized with a
-lock so interleaved runs cannot confuse the operator-facing drill scenarios.
+timeouts); FastAPI executes it in the threadpool, so parallel requests run on
+parallel worker threads and share one process-wide in-flight byte quota
+(ByteQuota, configured by PROBE_INFLIGHT_QUOTA_BYTES, minimum 1536 bytes).
 """
 from __future__ import annotations
 
 import os
-import threading
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, model_validator
 
 from common.protocol import MAX_PACKET_SIZE, MIN_PACKET_SIZE
 from prober.app.engine import MAX_BUDGET, ProbeEngine
+from prober.app.quota import QUOTA_ENV_VAR, ByteQuota, env_quota_limit
 
 RECEIVER_HOST = os.environ.get("RECEIVER_HOST", "127.0.0.1")
 RECEIVER_PORT = int(os.environ.get("RECEIVER_PORT", "5055"))
 
-app = FastAPI(title="udp-pmtu-prober", version="1.0.0")
-_run_lock = threading.Lock()
+# One cap for the whole process: every concurrent /probe run draws from it.
+# A bad value fails fast at startup instead of silently corrupting the limit.
+QUOTA = ByteQuota(env_quota_limit())
+
+app = FastAPI(title="udp-pmtu-prober", version="1.1.0")
 
 
 class ProbeRequest(BaseModel):
@@ -53,7 +57,17 @@ class ProbeRequest(BaseModel):
 
 @app.get("/healthz")
 def healthz():
-    return {"status": "ok", "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}"}
+    return {
+        "status": "ok",
+        "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}",
+        QUOTA_ENV_VAR: QUOTA.limit,
+    }
+
+
+@app.get("/quota")
+def quota_status():
+    """Process-wide in-flight byte budget and its current utilization."""
+    return QUOTA.snapshot()
 
 
 @app.post("/probe")
@@ -68,6 +82,8 @@ def probe(req: ProbeRequest):
         final_wait_s=(
             req.final_wait_ms if req.final_wait_ms is not None else req.timeout_ms
         ) / 1000.0,
+        quota=QUOTA,
     )
-    with _run_lock:
-        return engine.run()
+    # No global lock: concurrent runs proceed in parallel and coordinate only
+    # through the process-wide in-flight byte quota.
+    return engine.run()

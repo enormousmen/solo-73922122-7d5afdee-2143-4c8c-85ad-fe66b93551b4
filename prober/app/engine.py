@@ -14,6 +14,14 @@ Rules implemented (per the operations spec):
   min_suspected - max_confirmed <= 8 bytes, or when evidence runs out
   (budget exhausted / controls lost) — in the latter case the caller is
   told to retest.
+
+In-flight byte quota (low-bandwidth tunnel rule): when a :class:`ByteQuota`
+is supplied, the candidate and control of a group reserve their payload
+bytes together before either is sent. The wait for quota happens *before*
+the receipt-timeout window starts. Each packet's bytes are returned once:
+on its first valid receipt or when its own group times out (late receipts
+remain evidence but never return bytes twice). A failed send returns the
+unsent packet's bytes immediately.
 """
 from __future__ import annotations
 
@@ -31,6 +39,7 @@ from common.protocol import (
     build_probe,
     parse_packet,
 )
+from prober.app.quota import ByteQuota, QuotaLease
 
 # Linux <linux/in.h>: PMTU discovery mode "do" — set DF on every IPv4 packet.
 IP_MTU_DISCOVER = 10
@@ -48,8 +57,10 @@ class SentPacket:
     size: int
     kind: str  # "candidate" | "control"
     sent_at: float
-    status: str = "pending"  # pending | confirmed | no_receipt
+    status: str = "pending"  # pending | confirmed | no_receipt | send_failed
     rtt_ms: float | None = None
+    lease: QuotaLease | None = None
+    quota_release_reason: str | None = None
 
 
 @dataclass
@@ -62,6 +73,7 @@ class GroupRecord:
     control_on_time: bool = False
     strikes_after: int = 0
     note: str = ""
+    quota_wait_ms: float = 0.0
 
 
 class ProbeEngine:
@@ -76,6 +88,7 @@ class ProbeEngine:
         timeout_s: float = 0.5,
         budget: int = MAX_BUDGET,
         final_wait_s: float | None = None,
+        quota: ByteQuota | None = None,
     ):
         if not MIN_PACKET_SIZE <= min_size < max_size <= MAX_PACKET_SIZE:
             raise ValueError(
@@ -90,6 +103,7 @@ class ProbeEngine:
         self.timeout_s = timeout_s
         self.budget = budget
         self.final_wait_s = timeout_s if final_wait_s is None else final_wait_s
+        self.quota = quota
 
         self.run_id = uuid.uuid4().bytes[:8]
         self.started_at = time.monotonic()
@@ -109,9 +123,12 @@ class ProbeEngine:
         self.valid_receipts = 0
         self.duplicate_receipts = 0
         self.invalid_receipts = 0
+        self.quota_wait_total_s = 0.0
 
     # ------------------------------------------------------------------ loop
     def run(self) -> dict:
+        if self.quota is not None:
+            self.quota.run_enter()
         self._open_socket()
         try:
             while not self._finished():
@@ -129,6 +146,8 @@ class ProbeEngine:
             return self._report()
         finally:
             self.sock.close()
+            if self.quota is not None:
+                self.quota.run_exit()
 
     def _finished(self) -> bool:
         mc, ms = self._max_confirmed(), self._min_suspect()
@@ -159,17 +178,35 @@ class ProbeEngine:
     # ----------------------------------------------------------------- group
     def _run_group(self, candidate: int) -> None:
         self.group_no += 1
+        # Reserve both packets together BEFORE anything is sent. Blocking here
+        # does not consume the receipt timeout: the window starts only after
+        # the reservation succeeds.
+        leases, waited_s = self._reserve_group(candidate)
+        self.quota_wait_total_s += waited_s
+        cand_lease, ctrl_lease = leases
+        candidate_seq = self._send(candidate, "candidate", cand_lease)
+        control_seq = self._send(CONTROL_SIZE, "control", ctrl_lease)
         record = GroupRecord(
             group=self.group_no,
             candidate_size=candidate,
-            candidate_seq=self._send(candidate, "candidate"),
-            control_seq=self._send(CONTROL_SIZE, "control"),
+            candidate_seq=candidate_seq,
+            control_seq=control_seq,
+            quota_wait_ms=round(waited_s * 1000.0, 3),
         )
+        # Anchor the timeout window after quota acquisition, so time spent
+        # waiting for freed bytes is never counted as a receipt timeout.
         self._collect_until(time.monotonic() + self.timeout_s)
 
         cand = self.sent[record.candidate_seq]
         ctrl = self.sent[record.control_seq]
         record.control_on_time = ctrl.status == "confirmed"
+
+        # Group window over: every still-reserved packet gives its bytes back
+        # now. Packets already released by a valid receipt (or a failed send)
+        # are skipped — each packet's quota is returned at most once.
+        for rec in (cand, ctrl):
+            if rec.lease is not None and not rec.lease.released:
+                self._release_lease(rec, "group_timeout")
 
         if candidate in self.confirmed:
             # confirmed by this packet's receipt or a late earlier one
@@ -205,6 +242,16 @@ class ProbeEngine:
             self.inconclusive_streak += 1
         self.groups.append(record)
 
+    def _reserve_group(self, candidate: int) -> tuple[list[QuotaLease | None], float]:
+        if self.quota is None:
+            return [None, None], 0.0
+        leases, waited_s = self.quota.acquire_group(
+            run_hex=self.run_id.hex(),
+            group=self.group_no,
+            sizes=[(candidate, "candidate"), (CONTROL_SIZE, "control")],
+        )
+        return leases, waited_s
+
     # ---------------------------------------------------------------- socket
     def _open_socket(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -216,17 +263,39 @@ class ProbeEngine:
         self.sock.bind(("0.0.0.0", 0))
         self.sock.setblocking(False)
 
-    def _send(self, size: int, kind: str) -> int:
+    def _send(self, size: int, kind: str, lease: QuotaLease | None) -> int:
         self.seq += 1
+        seq = self.seq
+        if lease is not None:
+            lease.seq = seq
         packet = build_probe(
-            self.run_id, self.group_no, self.seq, size, control=(kind == "control")
+            self.run_id, self.group_no, seq, size, control=(kind == "control")
         )
-        self.sock.sendto(packet, (self.host, self.port))
-        self.sent[self.seq] = SentPacket(
-            group=self.group_no, seq=self.seq, size=size, kind=kind,
-            sent_at=time.monotonic(),
+        try:
+            self.sock.sendto(packet, (self.host, self.port))
+        except OSError:
+            # The packet never left: return its unsent bytes at once. It keeps
+            # no in-flight reservation and will simply time out like a loss.
+            if lease is not None:
+                lease.seq = seq
+                lease.release("send_failed")
+            self.sent[seq] = SentPacket(
+                group=self.group_no, seq=seq, size=size, kind=kind,
+                sent_at=time.monotonic(), status="send_failed", lease=lease,
+                quota_release_reason="send_failed" if lease is not None else None,
+            )
+            return seq
+        self.sent[seq] = SentPacket(
+            group=self.group_no, seq=seq, size=size, kind=kind,
+            sent_at=time.monotonic(), lease=lease,
         )
-        return self.seq
+        return seq
+
+    def _release_lease(self, rec: SentPacket, reason: str) -> None:
+        if rec.lease is None:
+            return
+        if rec.lease.release(reason):
+            rec.quota_release_reason = reason
 
     def _collect_until(self, deadline: float) -> None:
         while True:
@@ -260,6 +329,10 @@ class ProbeEngine:
         rec.status = "confirmed"
         rec.rtt_ms = round((now - rec.sent_at) * 1000.0, 3)
         self.valid_receipts += 1
+        # First valid receipt for this packet: return its bytes once. A late
+        # receipt for an already-timed-out packet still confirms the size below,
+        # but release() is a no-op then — bytes were given back at timeout.
+        self._release_lease(rec, "receipt")
         self.confirmed.add(rec.size)
         self.strikes.pop(rec.size, None)  # a confirmed size carries no strikes
         # invariant: suspected oversize must stay above every confirmed size
@@ -277,6 +350,9 @@ class ProbeEngine:
         for rec in self.sent.values():
             if rec.status == "pending":
                 rec.status = "no_receipt"
+            # Defensive: nothing should remain reserved when the run ends.
+            if rec.lease is not None and not rec.lease.released:
+                self._release_lease(rec, "run_end")
         mc = self._max_confirmed()
         if mc is not None:
             self.suspects = {s for s in self.suspects if s > mc}
@@ -314,6 +390,10 @@ class ProbeEngine:
             "stop_reason": self.stop_reason,
             "packets_sent": len(self.sent),
             "budget": self.budget,
+            "inflight_quota": {
+                "limit_bytes": self.quota.limit if self.quota else None,
+                "waited_for_quota_ms": round(self.quota_wait_total_s * 1000.0, 3),
+            },
             "receipts": {
                 "valid": self.valid_receipts,
                 "duplicates": self.duplicate_receipts,
@@ -328,6 +408,7 @@ class ProbeEngine:
                     "candidate_result": g.candidate_result,
                     "control_on_time": g.control_on_time,
                     "strikes_after": g.strikes_after,
+                    "quota_wait_ms": g.quota_wait_ms,
                     "note": g.note,
                 }
                 for g in self.groups
@@ -341,6 +422,8 @@ class ProbeEngine:
                     "status": p.status,
                     "sent_at_ms": round((p.sent_at - self.started_at) * 1000.0, 3),
                     "rtt_ms": p.rtt_ms,
+                    "quota_bytes": p.lease.size if p.lease else 0,
+                    "quota_release_reason": p.quota_release_reason,
                 }
                 for p in self.sent.values()
             ],

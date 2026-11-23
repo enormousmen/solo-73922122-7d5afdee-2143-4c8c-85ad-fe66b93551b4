@@ -23,6 +23,11 @@ services:
     environment:
       RECEIVER_HOST: receiver
       RECEIVER_PORT: "5055"
+      # Process-wide cap on payload bytes still awaiting receipts.
+      # Hard minimum 1536 (= largest group: 1472-byte candidate + 64 control).
+      # Override from the shell, e.g.
+      #   PROBE_INFLIGHT_QUOTA_BYTES=4096 docker compose up --build
+      PROBE_INFLIGHT_QUOTA_BYTES: "${PROBE_INFLIGHT_QUOTA_BYTES:-1536}"
     ports:
       - "8000:8000"
     depends_on:
